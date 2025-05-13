@@ -53,7 +53,8 @@ def truncate_tokens_from_messages(messages, model, max_gen_length):
     """
     Count the number of tokens used by a list of messages, 
     and truncate the messages if the number of tokens exceeds the limit.
-    Reference: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+    Reference for OpenAI: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
+    Qwen overheads derived from its tokenizer_config.json chat_template.
     """
     tokenizer = get_tokenizer_for_model(model)
     is_hf_tokenizer = PreTrainedTokenizerBase is not None and isinstance(tokenizer, PreTrainedTokenizerBase)
@@ -64,13 +65,28 @@ def truncate_tokens_from_messages(messages, model, max_gen_length):
     elif model == "gpt-4-0125-preview":
         max_prompt_tokens = 128000 - max_gen_length
     elif model.startswith("Qwen"):
-        max_prompt_tokens = 32768 - max_gen_length # Qwen3-32B native context length
+        # Qwen3-32B has max_position_embeddings: 40960 (from its config.json, as per README)
+        # This total capacity is split between prompt and generation.
+        # README: "reserving 32,768 tokens for outputs and 8,192 tokens for typical prompts"
+        # So, total_capacity = 40960
+        total_qwen_capacity = 40960
+        max_prompt_tokens = total_qwen_capacity - max_gen_length
+        if max_prompt_tokens < 0: # Safety check
+            print(f"Warning: max_gen_length ({max_gen_length}) for Qwen model exceeds or meets total capacity ({total_qwen_capacity}). Setting max_prompt_tokens to 0.")
+            max_prompt_tokens = 0
     else:
         # Default for other models, assuming a smaller context like gpt-3.5-turbo if not specified
         max_prompt_tokens = 4096 - max_gen_length
     
-    tokens_per_message = 3  # OpenAI specific: every message follows <|start|>{role/name}\n{content}<|end|>\n
-    num_total_tokens = 3  # OpenAI specific: every reply is primed with <|start|>assistant<|message|>
+    if model.startswith("Qwen"):
+        # Qwen: Each message is <|im_start|>role\ncontent<|im_end|>\n
+        # Overhead: <|im_start|> (1) + role (1) + \n (1) + <|im_end|> (1) + \n (1) = 5 tokens per message.
+        tokens_per_message = 5
+        # Qwen assistant reply priming: <|im_start|>assistant\n -> 3 tokens.
+        num_total_tokens = 3
+    else: # OpenAI models (based on cookbook approximation)
+        tokens_per_message = 3  # OpenAI specific: every message follows <|start|>{role/name}\n{content}<|end|>\n
+        num_total_tokens = 3  # OpenAI specific: every reply is primed with <|start|>assistant<|message|>
     
     processed_messages = []
 
