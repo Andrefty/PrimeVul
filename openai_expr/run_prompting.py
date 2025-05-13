@@ -11,9 +11,42 @@ from openai._types import NOT_GIVEN
 from utils import SYS_INST, PROMPT_INST, PROMPT_INST_COT, ONESHOT_ASSISTANT, ONESHOT_USER, TWOSHOT_USER, TWOSHOT_ASSISTANT
 
 import tiktoken
+try:
+    from transformers import AutoTokenizer, PreTrainedTokenizerBase
+except ImportError:
+    AutoTokenizer = None
+    PreTrainedTokenizerBase = None
+    print("Warning: `transformers` library not installed. Qwen models will use tiktoken for token counting.")
 
-# add your OpenAI API key here
-client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+# Tokenizer cache
+_tokenizer_cache = {}
+
+def get_tokenizer_for_model(model_name):
+    if model_name in _tokenizer_cache:
+        return _tokenizer_cache[model_name]
+
+    tokenizer_obj = None
+    if model_name.startswith("Qwen") and AutoTokenizer is not None:
+        try:
+            tokenizer_obj = AutoTokenizer.from_pretrained(model_name)
+            print(f"Using Hugging Face AutoTokenizer for {model_name} for token counting.")
+        except Exception as e:
+            print(f"Warning: Failed to load AutoTokenizer for {model_name}. Error: {e}. Falling back to tiktoken cl100k_base.")
+            tokenizer_obj = tiktoken.get_encoding("cl100k_base")
+    else:
+        if model_name.startswith("Qwen"): # Transformers not available or failed, print specific warning
+            print(f"Using tiktoken for Qwen model {model_name} due to AutoTokenizer issue or missing 'transformers' library.")
+        try:
+            tokenizer_obj = tiktoken.encoding_for_model(model_name)
+        except KeyError:
+            print(f"Warning: tiktoken model {model_name} not found. Using cl100k_base encoding.")
+            tokenizer_obj = tiktoken.get_encoding("cl100k_base")
+
+    _tokenizer_cache[model_name] = tokenizer_obj
+    return tokenizer_obj
+
+# client = OpenAI(api_key=os.environ["OPENAI_API_KEY"]) # Will be initialized in main
+client = None
 
 
 def truncate_tokens_from_messages(messages, model, max_gen_length):
@@ -22,37 +55,92 @@ def truncate_tokens_from_messages(messages, model, max_gen_length):
     and truncate the messages if the number of tokens exceeds the limit.
     Reference: https://github.com/openai/openai-cookbook/blob/main/examples/How_to_count_tokens_with_tiktoken.ipynb
     """
+    tokenizer = get_tokenizer_for_model(model)
+    is_hf_tokenizer = PreTrainedTokenizerBase is not None and isinstance(tokenizer, PreTrainedTokenizerBase)
 
     if model == "gpt-3.5-turbo-0125":
-        max_tokens = 16385 - max_gen_length
+        # Max context tokens for the model - max generation tokens requested
+        max_prompt_tokens = 16385 - max_gen_length
     elif model == "gpt-4-0125-preview":
-        max_tokens = 128000 - max_gen_length
+        max_prompt_tokens = 128000 - max_gen_length
+    elif model.startswith("Qwen"):
+        max_prompt_tokens = 32768 - max_gen_length # Qwen3-32B native context length
     else:
-        max_tokens = 4096 - max_gen_length
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
-        print("Warning: model not found. Using cl100k_base encoding.")
-        encoding = tiktoken.get_encoding("cl100k_base")
+        # Default for other models, assuming a smaller context like gpt-3.5-turbo if not specified
+        max_prompt_tokens = 4096 - max_gen_length
     
-    tokens_per_message = 3
+    tokens_per_message = 3  # OpenAI specific: every message follows <|start|>{role/name}\n{content}<|end|>\n
+    num_total_tokens = 3  # OpenAI specific: every reply is primed with <|start|>assistant<|message|>
+    
+    processed_messages = []
 
-    num_tokens = 3  # every reply is primed with <|start|>assistant<|message|>
-    trunc_messages = []
-    for message in messages:
-        tm = {}
-        num_tokens += tokens_per_message
-        for key, value in message.items():
-            encoded_value = encoding.encode(value)
-            num_tokens += len(encoded_value)
-            if num_tokens > max_tokens:
-                print(f"Truncating message: {value[:100]}...")
-                tm[key] = encoding.decode(encoded_value[:max_tokens - num_tokens])
-                break
-            else:
-                tm[key] = value
-        trunc_messages.append(tm)
-    return trunc_messages
+    for message_idx, message_dict in enumerate(messages):
+        # Check if there's space for the message overhead
+        if num_total_tokens + tokens_per_message > max_prompt_tokens:
+            print(f"Max tokens reached before message {message_idx}. Skipping remaining messages.")
+            break
+        
+        num_total_tokens += tokens_per_message
+        current_processed_message = {}
+
+        for key, value in message_dict.items():
+            if not isinstance(value, str) or not value: # Non-string or empty string values
+                current_processed_message[key] = value
+                continue
+
+            # Check if there's any space left before encoding this value
+            if num_total_tokens >= max_prompt_tokens:
+                current_processed_message[key] = "" # No space, set to empty
+                continue 
+
+            if is_hf_tokenizer:
+                encoded_value = tokenizer.encode(value, add_special_tokens=False)
+            else: # tiktoken
+                encoded_value = tokenizer.encode(value)
+            
+            value_token_count = len(encoded_value)
+
+            if num_total_tokens + value_token_count > max_prompt_tokens:
+                print(f"Truncating content for key '{key}' in message {message_idx}: '{value[:100]}...'")
+                tokens_can_take_for_this_value = max_prompt_tokens - num_total_tokens
+                
+                if tokens_can_take_for_this_value <= 0:
+                    current_processed_message[key] = ""
+                else:
+                    truncated_encoded_value = encoded_value[:tokens_can_take_for_this_value]
+                    if is_hf_tokenizer:
+                        current_processed_message[key] = tokenizer.decode(truncated_encoded_value, skip_special_tokens=True)
+                    else: # tiktoken
+                        current_processed_message[key] = tokenizer.decode(truncated_encoded_value)
+                    num_total_tokens += len(truncated_encoded_value)
+                # This field was truncated, so this message cannot contain subsequent fields.
+                # Add any remaining keys from original message_dict with empty string values
+                # to ensure the message structure is preserved if other code expects those keys.
+                for original_key in message_dict:
+                    if original_key not in current_processed_message:
+                        current_processed_message[original_key] = ""
+                break # Break from iterating over keys in the current message_dict
+            else: # Value fits fully
+                current_processed_message[key] = value # Use original value string
+                num_total_tokens += value_token_count
+        
+        # Ensure all keys from original message are in current_processed_message,
+        # even if they were not processed due to an earlier break (they'd be empty).
+        # This is important if the `break` above was hit.
+        for original_key in message_dict:
+            if original_key not in current_processed_message:
+                 # This case implies the key was after a truncated key, so it should be empty.
+                current_processed_message[original_key] = ""
+
+
+        processed_messages.append(current_processed_message)
+        
+        if num_total_tokens >= max_prompt_tokens: # Check after processing a message
+            if message_idx < len(messages) -1 :
+                 print(f"Max tokens reached after processing message {message_idx}. Skipping further messages.")
+            break
+            
+    return processed_messages
 
 
 # get completion from an OpenAI chat model
@@ -78,6 +166,16 @@ def get_openai_chat(
     
     # count the number of tokens in the prompt
     messages = truncate_tokens_from_messages(messages, args.model, args.max_gen_length)
+    
+    extra_body_params = {}
+    if args.model.startswith("Qwen"):
+        if hasattr(args, 'enable_thinking'):
+            extra_body_params["enable_thinking"] = args.enable_thinking
+        if hasattr(args, 'top_k') and args.top_k is not None: # Check if top_k is provided
+            extra_body_params["top_k"] = args.top_k
+        if hasattr(args, 'min_p') and args.min_p is not None: # Check if min_p is provided
+            extra_body_params["min_p"] = args.min_p
+
     # get response from OpenAI
     try:
         response = client.chat.completions.create(
@@ -85,9 +183,11 @@ def get_openai_chat(
             messages=messages,
             max_tokens=args.max_gen_length,
             temperature=args.temperature,
+            top_p=args.top_p if hasattr(args, 'top_p') and args.top_p is not None else NOT_GIVEN, # Pass top_p
             seed=args.seed,
             logprobs=args.logprobs,
             top_logprobs=5 if args.logprobs else NOT_GIVEN,
+            extra_body=extra_body_params if extra_body_params else NOT_GIVEN,
             )
         response_content = response.choices[0].message.content
         response_logprobs = response.choices[0].logprobs.content[0].top_logprobs if args.logprobs else None
@@ -134,19 +234,39 @@ def construct_prompts(input_file, inst):
 
 
 def main():
+    global client # Added to modify global client
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default="gpt-3.5-turbo-0125", choices=["gpt-3.5-turbo-0125", "gpt-4-0125-preview"], help='Model name')
+    parser.add_argument('--model', type=str, default="Qwen/Qwen3-32B", # Changed default
+                        choices=["gpt-3.5-turbo-0125", "gpt-4-0125-preview", "Qwen/Qwen3-32B", "Qwen/Qwen3-8B"], # Added Qwen models
+                        help='Model name')
     parser.add_argument('--prompt_strategy', type=str, choices=["std_cls", "cot"], default="standard", help='Prompt strategy')
     parser.add_argument('--data_path', type=str, help='Data path')
     parser.add_argument('--output_folder', type=str, help='Output folder')
     parser.add_argument('--temperature', type=float, default=0.0, help='Sampling temperature')
+    parser.add_argument('--top_p', type=float, default=None, help='Nucleus sampling parameter') # Added top_p
+    parser.add_argument('--top_k', type=int, default=None, help='Top-k sampling parameter (for Qwen models via SGLang)') # Added top_k
+    parser.add_argument('--min_p', type=float, default=None, help='Min-p sampling parameter (for Qwen models via SGLang)') # Added min_p
     parser.add_argument('--max_gen_length', type=int, default=1024)
     parser.add_argument('--seed', type=int, default=12345)
     parser.add_argument('--logprobs', action="store_true", help='Return logprobs')
     parser.add_argument('--fewshot_eg', action="store_true", help='Use few-shot examples')
+    parser.add_argument('--enable_thinking', type=lambda x: (str(x).lower() == 'true'), default=True,
+                        help='(For Qwen models) Enable thinking mode. Default: True') # Added for Qwen
     args = parser.parse_args()
 
-    output_file = os.path.join(args.output_folder, f"{args.model}_{args.prompt_strategy}_logprobs{args.logprobs}_fewshoteg{args.fewshot_eg}.jsonl")
+    # Initialize client based on model
+    if args.model.startswith("Qwen"):
+        client = OpenAI(
+            api_key="EMPTY",
+            base_url="http://127.0.0.1:30000/v1" # User's SGLang server
+        )
+    else:
+        if "OPENAI_API_KEY" not in os.environ:
+            raise ValueError("OPENAI_API_KEY environment variable not set for OpenAI models.")
+        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+
+
+    output_file = os.path.join(args.output_folder, f"{args.model.replace('/', '_')}_{args.prompt_strategy}_logprobs{args.logprobs}_fewshoteg{args.fewshot_eg}.jsonl") # Replaced / in model name for filename
     if args.prompt_strategy == "std_cls":
             inst = PROMPT_INST
     elif args.prompt_strategy == "cot":
@@ -156,7 +276,7 @@ def main():
     prompts = construct_prompts(args.data_path, inst)
 
     with open(output_file, "w") as f:
-        print(f"Requesting {args.model} to respond to {len(prompts)} {args.data} prompts ...")
+        print(f"Requesting {args.model} to respond to {len(prompts)} {args.data_path} prompts ...")
         for p in tqdm(prompts):
             response, logprobs = get_openai_chat(p, args)
             if logprobs:
