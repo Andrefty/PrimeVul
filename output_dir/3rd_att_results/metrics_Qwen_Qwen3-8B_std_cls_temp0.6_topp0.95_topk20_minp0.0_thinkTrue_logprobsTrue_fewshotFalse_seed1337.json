@@ -1,0 +1,28 @@
+{
+    "input_file": "/export/home/acs/stud/t/tudor.farcasanu/SSL_research/PrimeVul/output_dir/Qwen_Qwen3-8B_std_cls_temp0.6_topp0.95_topk20_minp0.0_thinkTrue_logprobsTrue_fewshotFalse_seed1337.jsonl",
+    "prompt_strategy": "std_cls",
+    "total_samples_initially_read": 870,
+    "samples_with_missing_target": 0,
+    "unparseable_responses": 0,
+    "valid_samples_for_std_metrics": 870,
+    "standard_metrics": {
+        "accuracy": 0.5275862068965518,
+        "precision": 0.5689655172413793,
+        "recall": 0.22758620689655173,
+        "f1_score": 0.32512315270935965
+    },
+    "pairwise_metrics": {
+        "total_commit_ids_processed_for_pairing": 423,
+        "total_structurally_valid_pairs_found": 407,
+        "pairs_skipped_due_to_unparseable_predictions": 0,
+        "pairs_used_for_px_calculation": 407,
+        "P-C_count": 52,
+        "P-C_ratio": 0.12776412776412777,
+        "P-V_count": 37,
+        "P-V_ratio": 0.09090909090909091,
+        "P-B_count": 285,
+        "P-B_ratio": 0.7002457002457002,
+        "P-R_count": 33,
+        "P-R_ratio": 0.08108108108108109
+    }
+}

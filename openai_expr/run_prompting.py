@@ -288,6 +288,7 @@ def construct_prompts(input_file, inst_template_str_unused): # inst_template_str
         key = sample.get("project", "unknown_project") + "_" + sample.get("commit_id", "unknown_commit")
         p_data = {"sample_key": key}
         p_data["idx"] = sample.get("idx", -1) # Add this line to get 'idx'
+        p_data["commit_id"] = sample.get("commit_id", "unknown_commit") # Add this line
         p_data["func"] = sample.get("func", "") # Store raw function code
         p_data["target"] = sample.get("target", -1)
         # "prompt" field is no longer pre-formatted here, as formatting happens after truncation
